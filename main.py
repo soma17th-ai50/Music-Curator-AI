@@ -53,28 +53,56 @@ def load_profile():
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
+def _empty_state() -> dict:
+    return {
+        "user_input":          "",
+        "session_id":          st.session_state.session_id,
+        "messages":            st.session_state.agent_messages,
+        "intent":              None,
+        "mood":                None,
+        "activity":            None,
+        "context":             None,
+        "feedback_type":       None,
+        "liked_artists_input": None,
+        "user_profile":        None,
+        "candidates":          None,
+        "recommendations":     None,
+        "button_event":        None,
+        "target_track_id":     None,
+        "target_track_name":   None,
+        "target_track_artist": None,
+        "response":            None,
+    }
+
+
 def run_agent(user_input: str) -> dict:
     graph = load_graph()
-    state = {
-        "user_input":    user_input,
-        "session_id":    st.session_state.session_id,
-        "messages":      st.session_state.agent_messages,
-        "intent":        None,
-        "mood":          None,
-        "activity":      None,
-        "context":       None,
-        "feedback_type": None,
-        "liked_artists_input": None,
-        "user_profile":  None,
-        "candidates":    None,
-        "recommendations": None,
-        "response":      None,
-    }
+    state = _empty_state()
+    state["user_input"] = user_input
     result = graph.invoke(state)
-    # Accumulate messages for next turn
     st.session_state.agent_messages = (
         st.session_state.agent_messages + result.get("messages", [])
-    )[-20:]   # keep last 10 exchanges
+    )[-20:]
+    return result
+
+
+def run_agent_button(track: dict, feedback_type: str) -> dict:
+    """👍/👎 버튼 클릭 → 그래프를 feedback intent로 invoke."""
+    graph = load_graph()
+    state = _empty_state()
+    state.update({
+        "user_input":          f"[BUTTON_{feedback_type.upper()}] {track.get('track_name')} — {track.get('artist_name')}",
+        "intent":              "feedback",
+        "feedback_type":       feedback_type,
+        "button_event":        True,
+        "target_track_id":     track.get("track_id"),
+        "target_track_name":   track.get("track_name"),
+        "target_track_artist": track.get("artist_name"),
+    })
+    result = graph.invoke(state)
+    st.session_state.agent_messages = (
+        st.session_state.agent_messages + result.get("messages", [])
+    )[-20:]
     return result
 
 
@@ -82,20 +110,33 @@ def _spotify_url(track_id: str) -> str:
     return f"https://open.spotify.com/track/{track_id}"
 
 
-def render_recommendation_cards(recs: list):
+def render_recommendation_cards(recs: list, key_prefix: str = "live"):
     if not recs:
         return
+
     cols = st.columns(min(len(recs), 3))
     for i, track in enumerate(recs[:6]):
         col = cols[i % 3]
         track_id = track.get("track_id", "")
-        spotify_btn = (
-            f'<a href="{_spotify_url(track_id)}" target="_blank" style="'
-            'display:inline-block; margin-top:10px; padding:5px 12px;'
-            'background:#1DB954; color:#fff; border-radius:20px;'
-            'font-size:0.78em; font-weight:bold; text-decoration:none;">▶ Spotify에서 듣기</a>'
-            if track_id else ""
-        )
+        artist_name = track.get("artist_name", "")
+        # Spotify 링크: 클릭 시 부모 윈도우 URL에 ?clicked_track=... 를 심고
+        # popstate를 트리거 → 다음 rerun 때 main()이 query_params에서 읽어 기록.
+        if track_id:
+            onclick = (
+                "const u = new URL(window.parent.location.href);"
+                f"u.searchParams.set('clicked_track', '{track_id}');"
+                "window.parent.history.replaceState({}, '', u);"
+                "window.parent.dispatchEvent(new Event('popstate'));"
+            )
+            spotify_btn = (
+                f'<a href="{_spotify_url(track_id)}" target="_blank" '
+                f'onclick="{onclick}" style="'
+                'display:inline-block; margin-top:10px; padding:5px 12px;'
+                'background:#1DB954; color:#fff; border-radius:20px;'
+                'font-size:0.78em; font-weight:bold; text-decoration:none;">▶ Spotify에서 듣기</a>'
+            )
+        else:
+            spotify_btn = ""
         with col:
             st.markdown(f"""
 <div style="
@@ -110,7 +151,7 @@ def render_recommendation_cards(recs: list):
         🎵 {track.get('track_name','?')}
     </div>
     <div style="font-size:0.9em; color:#a0a0b0; margin-bottom:8px;">
-        🎤 {track.get('artist_name','?')}
+        🎤 {artist_name or '?'}
     </div>
     <div style="font-size:0.78em; color:#a0c4d8; margin-bottom:8px; line-height:1.4;">
         {track.get('reason', '')}
@@ -123,6 +164,15 @@ def render_recommendation_cards(recs: list):
     {spotify_btn}
 </div>
 """, unsafe_allow_html=True)
+
+            if track_id:
+                like_col, dislike_col = st.columns(2)
+                if like_col.button("👍", key=f"like_{key_prefix}_{track_id}_{i}", use_container_width=True):
+                    st.session_state.pending_button = (track, "like")
+                    st.rerun()
+                if dislike_col.button("👎", key=f"dislike_{key_prefix}_{track_id}_{i}", use_container_width=True):
+                    st.session_state.pending_button = (track, "dislike")
+                    st.rerun()
 
 
 def render_profile_sidebar(profile: dict):
@@ -153,12 +203,6 @@ def render_profile_sidebar(profile: dict):
     st.sidebar.markdown(f"**👍 좋아요한 곡:** {len(liked_tracks)}개")
     st.sidebar.markdown(f"**👎 별로인 곡:** {len(profile.get('disliked_tracks', []))}개")
 
-    mood_hist = profile.get("mood_history", [])
-    if mood_hist:
-        from collections import Counter
-        top_mood = Counter(mood_hist).most_common(1)[0][0]
-        st.sidebar.markdown(f"**자주 찾는 분위기:** {top_mood}")
-
     st.sidebar.divider()
 
     # ── 대화 초기화 ────────────────────────────────────────────────────────
@@ -184,6 +228,13 @@ def main():
         st.error(str(e))
         st.stop()
 
+    # Spotify 링크 클릭 시그널 (이전 인터랙션에서 onclick으로 심긴 query param 회수)
+    clicked = st.query_params.get("clicked_track")
+    if clicked:
+        from src.memory.profile import UserProfileManager
+        UserProfileManager().add_clicked_track(st.session_state.session_id, clicked)
+        st.query_params.clear()
+
     # Profile sidebar
     st.session_state.profile = load_profile()
     render_profile_sidebar(st.session_state.profile)
@@ -196,8 +247,41 @@ def main():
     st.title("🎵 Music Curator AI")
     st.caption("상황과 기분에 맞는 음악을 추천받고, 왜 그 곡인지 설명도 들어보세요.")
 
-    # ── Quick-start chips ───────────────────────────────────────────────────
-    if not st.session_state.chat_history:
+    # ── Cold-start 온보딩 (빈 프로필 + 첫 진입) ─────────────────────────────
+    needs_onboarding = (
+        not st.session_state.chat_history
+        and not st.session_state.profile.get("liked_artists")
+        and not st.session_state.get("onboarding_skipped")
+    )
+
+    if needs_onboarding:
+        with st.container(border=True):
+            st.markdown("### 👋 처음 오셨네요!")
+            st.caption("좋아하는 아티스트를 알려주시면 추천이 훨씬 정확해져요. (3명 권장, 쉼표로 구분)")
+            with st.form("onboarding_form", clear_on_submit=True):
+                artists_input = st.text_input(
+                    "좋아하는 아티스트",
+                    placeholder="예: IU, 검정치마, 새소년",
+                    label_visibility="collapsed",
+                )
+                col_submit, col_skip = st.columns([3, 1])
+                submitted = col_submit.form_submit_button("등록하기", use_container_width=True, type="primary")
+                skipped = col_skip.form_submit_button("나중에", use_container_width=True)
+
+            if submitted and artists_input.strip():
+                from src.memory.profile import UserProfileManager
+                mgr = UserProfileManager()
+                names = [a.strip() for a in artists_input.split(",") if a.strip()]
+                for name in names:
+                    mgr.add_liked_artist(st.session_state.session_id, name)
+                st.session_state.profile = load_profile()
+                st.rerun()
+            if skipped:
+                st.session_state.onboarding_skipped = True
+                st.rerun()
+
+    # ── Quick-start chips (온보딩 완료 또는 건너뛴 사용자) ──────────────────
+    elif not st.session_state.chat_history:
         st.markdown("**빠른 시작 ↓**")
         chip_cols = st.columns(4)
         chips = [
@@ -212,11 +296,41 @@ def main():
                 st.rerun()
 
     # ── Chat history ────────────────────────────────────────────────────────
-    for entry in st.session_state.chat_history:
+    for entry_idx, entry in enumerate(st.session_state.chat_history):
         with st.chat_message(entry["role"]):
             st.markdown(entry["content"])
             if entry.get("recs"):
-                render_recommendation_cards(entry["recs"])
+                render_recommendation_cards(entry["recs"], key_prefix=f"hist{entry_idx}")
+
+    # ── Handle button feedback (👍/👎) ──────────────────────────────────────
+    pending_button = st.session_state.pop("pending_button", None)
+    if pending_button:
+        track, fb_type = pending_button
+        ack = "👍 좋아요" if fb_type == "like" else "👎 별로"
+        user_msg = f"{ack}: {track.get('track_name')} — {track.get('artist_name')}"
+        with st.chat_message("user"):
+            st.markdown(user_msg)
+        st.session_state.chat_history.append({"role": "user", "content": user_msg, "recs": []})
+
+        with st.chat_message("assistant"):
+            with st.spinner("피드백 반영 중..."):
+                try:
+                    result = run_agent_button(track, fb_type)
+                    response = result.get("response", "")
+                    recs = result.get("recommendations") or []
+                except Exception as e:
+                    response = f"오류가 발생했습니다: {e}"
+                    recs = []
+            st.markdown(response)
+            if recs:
+                render_recommendation_cards(recs, key_prefix="live")
+
+        st.session_state.chat_history.append({
+            "role": "assistant", "content": response, "recs": recs,
+        })
+        st.session_state.last_recs = recs
+        st.session_state.profile = load_profile()
+        st.rerun()
 
     # ── Handle quick-chip input ─────────────────────────────────────────────
     pending = st.session_state.pop("pending_input", None)
@@ -245,7 +359,7 @@ def main():
 
             st.markdown(response)
             if recs:
-                render_recommendation_cards(recs)
+                render_recommendation_cards(recs, key_prefix="live")
 
         st.session_state.chat_history.append({
             "role": "assistant",

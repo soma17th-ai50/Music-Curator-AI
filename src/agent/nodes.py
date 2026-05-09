@@ -77,6 +77,14 @@ def _recent_messages(state: AgentState, n: int = 6) -> list:
 # ---------------------------------------------------------------------------
 def analyze_input(state: AgentState) -> dict:
     """Classify user intent and extract mood / activity / context."""
+    # Button-click feedback: skip LLM, intent/feedback_type 이미 state에 세팅됨
+    if state.get("button_event"):
+        return {
+            "intent":        state.get("intent"),
+            "feedback_type": state.get("feedback_type"),
+            "messages":      [HumanMessage(content=state["user_input"])],
+        }
+
     system = SystemMessage(content="""
 당신은 음악 추천 에이전트의 의도 분류기입니다.
 사용자 메시지를 분석해 intent, mood, activity, context, feedback_type, liked_artists를 추출하세요.
@@ -94,7 +102,14 @@ def analyze_input(state: AgentState) -> dict:
     messages = [system] + _recent_messages(state) + [
         HumanMessage(content=state["user_input"])
     ]
-    result: IntentResult = _intent_llm.invoke(messages)
+    result: Optional[IntentResult] = _intent_llm.invoke(messages)
+
+    # LLM이 스키마에 맞는 응답을 못 주면 None 반환 → chat으로 폴백
+    if result is None:
+        return {
+            "intent": "chat",
+            "messages": [HumanMessage(content=state["user_input"])],
+        }
 
     return {
         "intent":              result.intent,
@@ -137,15 +152,27 @@ def update_profile(state: AgentState) -> dict:
             manager.add_liked_artist(session, artist)
 
     elif intent == "feedback":
-        recs = state.get("recommendations") or []
         fb = state.get("feedback_type")
-        if recs:
-            first = recs[0]
+        target_id = state.get("target_track_id")
+        target_artist = state.get("target_track_artist")
+        if target_id:
+            # 버튼 클릭: 정확한 곡이 지정됨
             if fb == "like":
-                manager.add_liked_track(session, first["track_id"])
-                manager.add_liked_artist(session, first["artist_name"])
+                manager.add_liked_track(session, target_id)
+                if target_artist:
+                    manager.add_liked_artist(session, target_artist)
             elif fb == "dislike":
-                manager.add_disliked_track(session, first["track_id"])
+                manager.add_disliked_track(session, target_id)
+        else:
+            # 텍스트 발화: 직전 추천 첫 곡으로 폴백
+            recs = state.get("recommendations") or []
+            if recs:
+                first = recs[0]
+                if fb == "like":
+                    manager.add_liked_track(session, first["track_id"])
+                    manager.add_liked_artist(session, first["artist_name"])
+                elif fb == "dislike":
+                    manager.add_disliked_track(session, first["track_id"])
 
     updated = manager.get_profile(session)
     return {"user_profile": updated}
@@ -164,6 +191,8 @@ def search_music(state: AgentState) -> dict:
         context=state.get("context"),
         liked_artists=profile.get("liked_artists", []),
         disliked_tracks=profile.get("disliked_tracks", []),
+        liked_tracks=profile.get("liked_tracks", []),
+        clicked_tracks=profile.get("clicked_tracks", []),
         top_k=20,
     )
     return {"candidates": candidates}
@@ -191,7 +220,27 @@ def generate_response(state: AgentState) -> dict:
     if state.get("context"):
         ctx_parts.append(f"맥락: {state['context']}")
 
-    user_content = state["user_input"]
+    # 버튼 이벤트: user_input을 자연어 컨텍스트로 변환
+    if state.get("button_event"):
+        target_name = state.get("target_track_name") or "?"
+        target_artist = state.get("target_track_artist") or "?"
+        fb_type = state.get("feedback_type")
+        if fb_type == "like":
+            user_content = (
+                f"[버튼 피드백] 사용자가 방금 '{target_name}' — {target_artist} 곡에 👍 좋아요를 눌렀습니다. "
+                "이 곡이 마음에 들었을 만한 이유를 한 문장으로 짧게 짚어주고, "
+                "비슷한 분위기의 곡을 새로 추천해 주세요."
+            )
+        elif fb_type == "dislike":
+            user_content = (
+                f"[버튼 피드백] 사용자가 방금 '{target_name}' — {target_artist} 곡에 👎 별로를 눌렀습니다. "
+                "어떤 면이 마음에 들지 않았을지 한 문장으로 짧게 추측해 주고, "
+                "다른 스타일의 곡을 새로 추천해 주세요."
+            )
+        else:
+            user_content = state["user_input"]
+    else:
+        user_content = state["user_input"]
     if ctx_parts:
         user_content += "\n\n[컨텍스트]\n" + "\n".join(ctx_parts)
 

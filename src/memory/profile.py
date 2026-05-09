@@ -115,6 +115,16 @@ class UserProfileManager:
             profile["disliked_tracks"] = tracks[-200:]
             self.save_profile(session_id, profile)
 
+    def add_clicked_track(self, session_id: str, track_id: str):
+        profile = self.get_profile(session_id)
+        if track_id in profile.get("liked_tracks", []) or track_id in profile.get("disliked_tracks", []):
+            return
+        clicked = profile.get("clicked_tracks", [])
+        if track_id not in clicked:
+            clicked.append(track_id)
+            profile["clicked_tracks"] = clicked[-200:]
+            self.save_profile(session_id, profile)
+
     def record_mood(self, session_id: str, mood: str):
         profile = self.get_profile(session_id)
         history: List[str] = profile.get("mood_history", [])
@@ -131,4 +141,5 @@ class UserProfileManager:
             "disliked_tracks": [],
             "liked_genres":    [],
             "mood_history":    [],
+            "clicked_tracks":  [],
         }

@@ -24,5 +24,11 @@ class AgentState(TypedDict):
     candidates: Optional[List[Dict[str, Any]]]
     recommendations: Optional[List[Dict[str, Any]]]
 
+    # Button-driven feedback (👍/👎 click) — bypasses intent classification
+    button_event: Optional[bool]
+    target_track_id: Optional[str]
+    target_track_name: Optional[str]
+    target_track_artist: Optional[str]
+
     # Final output
     response: Optional[str]

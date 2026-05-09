@@ -235,6 +235,16 @@ class MusicDataset:
         return self._COSINE_W * cos_sim + self._EUCLIDEAN_W * euc_sim
 
     # ------------------------------------------------------------------
+    def _centroid(self, track_ids: List[str]) -> Optional[np.ndarray]:
+        """6차원 FEATURE_COLS 평균 벡터. 매칭 0개면 None."""
+        if not track_ids:
+            return None
+        sub = self._df[self._df["track_id"].isin(track_ids)]
+        if len(sub) == 0:
+            return None
+        return sub[FEATURE_COLS].mean().values.astype(float)
+
+    # ------------------------------------------------------------------
     def search(
         self,
         mood: Optional[str] = None,
@@ -242,6 +252,8 @@ class MusicDataset:
         context: Optional[str] = None,
         liked_artists: Optional[List[str]] = None,
         disliked_tracks: Optional[List[str]] = None,
+        liked_tracks: Optional[List[str]] = None,
+        clicked_tracks: Optional[List[str]] = None,
         top_k: int = 20,
     ) -> List[Dict[str, Any]]:
         df = self._df.copy()
@@ -268,12 +280,42 @@ class MusicDataset:
         df["_score"] += self._derived_boost(df, mood, activity)
 
         # ⑤ 선호 아티스트 가중치
+        # liked_artists 는 ['PSY, SUGA', 'IU'] 처럼 한 항목에 여러 아티스트가
+        # 콤마로 묶여 들어올 수 있고(LLM 추출 품질 문제),
+        # artist_name 컬럼도 'Eminem, Young M.A' 같은 피처링 표기를 가짐.
+        # 양쪽 모두 콤마로 토큰화한 뒤 대소문자 무시 정확 매칭.
         if liked_artists:
-            liked_lower = [a.lower() for a in liked_artists]
-            artist_boost = df["artist_name"].str.lower().apply(
-                lambda n: 0.15 if any(l in n or n in l for l in liked_lower) else 0.0
-            )
-            df["_score"] += artist_boost
+            liked_set = set()
+            for raw in liked_artists:
+                for tok in raw.split(","):
+                    tok = tok.strip().lower()
+                    if tok:
+                        liked_set.add(tok)
+            if liked_set:
+                def _artist_match(name: str) -> bool:
+                    tokens = {t.strip().lower() for t in str(name).split(",")}
+                    return bool(tokens & liked_set)
+                artist_boost = df["artist_name"].apply(
+                    lambda n: 0.15 if _artist_match(n) else 0.0
+                )
+                df["_score"] += artist_boost
+
+        # ⑥ 사용자 신호 centroid (좋아요 +, 별로 -, 클릭 +)
+        if liked_tracks:
+            c = self._centroid(liked_tracks)
+            if c is not None:
+                like_sim = cosine_similarity([c], feature_matrix)[0]
+                df["_score"] += like_sim * 0.20
+        if disliked_tracks:
+            c = self._centroid(disliked_tracks)
+            if c is not None:
+                dis_sim = cosine_similarity([c], feature_matrix)[0]
+                df["_score"] -= dis_sim * 0.15
+        if clicked_tracks:
+            c = self._centroid(clicked_tracks)
+            if c is not None:
+                click_sim = cosine_similarity([c], feature_matrix)[0]
+                df["_score"] += click_sim * 0.08
 
         df = df.sort_values("_score", ascending=False)
         top = df.head(top_k)
